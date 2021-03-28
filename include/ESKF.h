@@ -7,7 +7,11 @@
 #include <Geometry.h>
 #include <iostream>
 #include <lTime.h>
+#include <vector>
+#include "ESKFattitude.h"
+#include "ESKFuwb.h"
 
+//wtf is this ??
 #define SUPPORT_STDIOSTREAM
 
 #define POS_IDX (0)
@@ -71,8 +75,8 @@ public:
 
     // Called when there is a new measurment from the IMU.
     // dt is the integration time of this sample, nominally the IMU sample period
-    void predictIMU(const Eigen::Vector3f& a_m, const Eigen::Vector3f& omega_m, const float dt, lTime stamp);
-
+    void predictIMU(const Eigen::Vector3f& a_m, const Eigen::Vector3f& omega_m, const float dt);
+    void justPredict(const Eigen::Vector3f& a_m, const Eigen::Vector3f& omega_m, const float dt);
     // Called when there is a new measurment from an absolute position reference.
     // Note that this has no body offset, i.e. it assumes exact observation of the center of the IMU.
     void measurePos(const Eigen::Vector3f& pos_meas, const Eigen::Matrix3f& pos_covariance, lTime stamp, lTime now);
@@ -104,6 +108,83 @@ public:
         lTime time;
     };
 
+    /** The mechanism of attitude measurement is
+    1. measureAttitudeSensor -> the entry point for measurement of attitude sensor,
+    2. getAttitudeSensorH -> get H, will be used by measureAttitudeSensor
+    3. getAttitudeSensorCovariance -> get covariance, will be used
+        by measureAttitudeSensor
+    4. getObservationVector -> will be used to get the observation Vector,
+        will be used by measureAttitudeSensor
+
+    getMultiplierConst will be used by getAttitudeSensorCovariance
+
+    Those functions can be used for accelerometer or magnetometer based
+    on the SensorContext ctx, there is already built-in SensorContext on
+    ESKFattitude.h
+    **/
+    void measureAttitudeSensor(const Eigen::Vector3f& measWithoutBias, SensorContext ctx);
+
+    void update_3D_attitudeSensor(
+                const Eigen::Vector3f& delta_measurement,
+                const Eigen::Matrix3f& meas_covariance,
+                const Eigen::Matrix<float, 3, dSTATE_SIZE>& H);
+
+    const Eigen::Matrix<float, 3, dSTATE_SIZE>
+    getAttitudeSensorH(Eigen::Matrix3f globalToBodyRot, SensorContext ctx);
+
+    Eigen::Matrix3f getAttitudeSensorCovariance(Eigen::Vector3f measWithoutBias, SensorContext ctx);
+
+    float getMultiplierConst(Eigen::Vector3f measWithoutBias, Eigen::Vector3f referenceVector,
+            const float alpha, const float maxC);
+
+
+    Eigen::Vector3f getObservationVector(Eigen::Vector3f measWithoutBias,
+                            Eigen::Matrix<float, 3, 3> globalToBodyRot,
+                            SensorContext ctx);
+
+    /** Below is attitude measurement functions,
+    with already input SensorContext
+    **/
+    void measureAccelerometer(const Eigen::Vector3f& measWithoutBias) {
+        measureAttitudeSensor(measWithoutBias, accContext);
+    }
+    void measureMagnetometer(const Eigen::Vector3f& measWithoutBias) {
+        measureAttitudeSensor(measWithoutBias, magnContext);
+    }
+    Eigen::Matrix3f getAccelerometerCovariance(Eigen::Vector3f accMeasWithoutBias) {
+        return getAttitudeSensorCovariance(accMeasWithoutBias, accContext);
+    }
+    Eigen::Matrix3f getMagnetometerCovariance(Eigen::Vector3f magMeasWithoutBias) {
+        return getAttitudeSensorCovariance(magMeasWithoutBias, magnContext);
+    }
+    const Eigen::Matrix<float, 3, dSTATE_SIZE>
+    getAccH(Eigen::Matrix<float, 3, 3> globalToBodyRot){
+        return getAttitudeSensorH(globalToBodyRot, accContext);
+    }
+    const Eigen::Matrix<float, 3, dSTATE_SIZE>
+    getMagH(Eigen::Matrix<float, 3, 3> globalToBodyRot){
+        return getAttitudeSensorH(globalToBodyRot, magnContext);
+    }
+
+    /** UWB measurement
+    getMeasurementUWB to update state with UWB
+    will use getUWB_Covariance, getUWB_H, updateUWB, and getUWB_Observ
+    to do it
+    **/
+    void measureUWB (Eigen::VectorXf uwbMeas);
+
+    Eigen::VectorXf getUWB_Observ (Eigen::VectorXf uwbMeas);
+
+    Eigen::Matrix<float, UWB_ANCHOR_COUNT, dSTATE_SIZE>
+    getUWB_H();
+
+    Eigen::Matrix<float, UWB_ANCHOR_COUNT, UWB_ANCHOR_COUNT>
+    getUWB_Covariance();
+
+    void update_UWB(
+            const Eigen::VectorXf& delta_measurement,
+            const Eigen::Matrix<float, UWB_ANCHOR_COUNT, UWB_ANCHOR_COUNT>& meas_covariance,
+            const Eigen::Matrix<float, UWB_ANCHOR_COUNT, dSTATE_SIZE>& H);
 private:
     Eigen::Matrix<float, 4, 3> getQ_dtheta(); // eqn 280, page 62
     void update_3D(const Eigen::Vector3f& delta_measurement,

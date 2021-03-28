@@ -1,5 +1,6 @@
 #include "ESKF.h"
 #include "unrolledFPFt.h"
+#include "debug.h"
 
 #define SQ(x) (x*x)
 #define I_3 (Eigen::Matrix3f::Identity())
@@ -7,6 +8,7 @@
 
 using namespace Eigen;
 using namespace std;
+
 
 ESKF::ESKF(Eigen::Vector3f a_gravity,
         const Eigen::Matrix<float, STATE_SIZE, 1>& initialState,
@@ -41,28 +43,6 @@ ESKF::ESKF(Eigen::Vector3f a_gravity,
     recentPtr = 0;
     firstMeasTime = lTime(INT32_MAX,INT32_MAX);
 
-    //handle time delay methods
-    if(delayHandling_ == larsonAverageIMU || delayHandling_ == larsonFull){
-        //init circular buffer for IMU
-        imuHistoryPtr_ = new  std::vector<imuMeasurement>(bufferL_);
-        PHistoryPtr_ = new std::vector<std::pair<lTime,Eigen::Matrix<float, dSTATE_SIZE, dSTATE_SIZE>>>(bufferL);
-        for(int i = 0; i < bufferL; i++){
-            imuHistoryPtr_->at(i).time = lTime(0,0);
-        }
-        Mptr = new Eigen::Matrix<float, dSTATE_SIZE, dSTATE_SIZE>;
-    }
-    if(delayHandling_ == larsonNewestIMU){
-        //init newest value
-        lastImu_.time = lTime(0,0);
-        Mptr = new Eigen::Matrix<float, dSTATE_SIZE, dSTATE_SIZE>;
-    }
-    if(delayHandling_ == applyUpdateToNew ||delayHandling_ == larsonAverageIMU){
-        //init circular buffer for state
-        stateHistoryPtr_ = new std::vector<std::pair<lTime,Eigen::Matrix<float, STATE_SIZE, 1>>>(bufferL_);
-        for(int i = 0; i < bufferL; i++){
-            stateHistoryPtr_->at(i).first = lTime(0,0);
-        }
-    }
 
 }
 
@@ -139,27 +119,8 @@ Vector3f ESKF::quatToRotVec(const Quaternionf& q) {
     return angAx.angle() * angAx.axis();
 }
 
-void ESKF::predictIMU(const Vector3f& a_m, const Vector3f& omega_m, const float dt, lTime stamp) {
+void ESKF::justPredict(const Vector3f& a_m, const Vector3f& omega_m, const float dt) {
     recentPtr ++;
-    //handle time delay methods
-    if(delayHandling_ == larsonAverageIMU || delayHandling_ == larsonFull){
-        //store the imu data for later.
-
-        imuMeasurement thisMeas;
-        thisMeas.time = stamp;
-        thisMeas.acc = a_m;
-        thisMeas.gyro = omega_m;
-        imuHistoryPtr_->at(recentPtr%bufferL_) = thisMeas;
-    }
-    if(delayHandling_ == larsonNewestIMU){
-        //store only the newest imu
-        imuMeasurement thisMeas;
-        thisMeas.time = stamp;
-        thisMeas.acc = a_m;
-        thisMeas.gyro = omega_m;
-        lastImu_ = thisMeas;
-    }
-
     // DCM of current state
     Matrix3f Rot = getDCM();
     // Accelerometer measurement
@@ -171,14 +132,73 @@ void ESKF::predictIMU(const Vector3f& a_m, const Vector3f& omega_m, const float 
     Quaternionf q_delta_theta = rotVecToQuat(delta_theta);
     Matrix3f R_delta_theta = q_delta_theta.toRotationMatrix();
 
+
+    DEBUG_PRINT("sanity check acc : " << (acc_global + a_gravity_));
+    DEBUG_PRINT("sanity check accbias : " << getAccelBias());
+
+
+    /**
+    Below is already computed in unrolled manner below this implementation
+    **/
+    // Jacobian of the state transition (eqn 269, page 59)
+    // Update dynamic parts only
+    // dPos row
+    F_x_.block<3, 3>(dPOS_IDX, dVEL_IDX).diagonal().fill(dt); // = I_3 * _dt
+    // dVel row
+    F_x_.block<3, 3>(dVEL_IDX, dTHETA_IDX) = -Rot * getSkew(acc_body) * dt;
+    F_x_.block<3, 3>(dVEL_IDX, dAB_IDX) = -Rot * dt;
+    // dTheta row
+    F_x_.block<3, 3>(dTHETA_IDX, dTHETA_IDX) = R_delta_theta.transpose();
+    F_x_.block<3, 3>(dTHETA_IDX, dGB_IDX).diagonal().fill(-dt); // = -I_3 * dt;
+
+    // Predict P and inject variance (with diagonal optimization)
+    P_ = F_x_*P_*F_x_.transpose();
+
+    // Matrix<float, dSTATE_SIZE, dSTATE_SIZE> Pnew;
+    // unrolledFPFt(P_, Pnew, dt,
+    //     -Rot * getSkew(acc_body) * dt,
+    //     -Rot * dt,
+    //     R_delta_theta.transpose());
+    // P_ = Pnew;
+
+    // Inject process noise
+    P_.diagonal().block<3, 1>(dVEL_IDX, 0).array() += var_acc_ * SQ(dt);
+    P_.diagonal().block<3, 1>(dTHETA_IDX, 0).array() += var_omega_ * SQ(dt);
+    P_.diagonal().block<3, 1>(dAB_IDX, 0).array() += var_acc_bias_ * dt;
+    P_.diagonal().block<3, 1>(dGB_IDX, 0).array() += var_omega_bias_ * dt;
+}
+
+void ESKF::predictIMU(const Vector3f& a_m, const Vector3f& omega_m, const float dt) {
+    recentPtr ++;
+    // DCM of current state
+    // Matrix3f Rot = getDCM();
+    Matrix3f Rot = rotVecToMat(quatToRotVec(quatFromHamilton(this->getQuatVector())));
+    // Accelerometer measurement
+    Vector3f acc_body = a_m - getAccelBias();
+    Vector3f acc_global = Rot.transpose() * acc_body;
+    std::cout << "acceleration: \n" << acc_global << std::endl;
+    // Gyro measruement
+    Vector3f omega = omega_m - getGyroBias();
+    Vector3f delta_theta = omega * dt;
+    Quaternionf q_delta_theta = rotVecToQuat(delta_theta);
+    Matrix3f R_delta_theta = q_delta_theta.toRotationMatrix();
+
+    // std::cout << "sanity check acc : " << (acc_global - a_gravity_) << std::endl;
+    DEBUG_PRINT("sanity check accbias : " << getAccelBias());
+
     // Nominal state kinematics (eqn 259, pg 58)
-    Vector3f delta_pos = getVel()*dt + 0.5f*(acc_global + a_gravity_)*dt*dt;
+
+    Vector3f delta_pos = getVel()*dt + 0.5f*(acc_global - a_gravity_)*dt*dt;
     nominalState_.block<3, 1>(POS_IDX, 0) += delta_pos;
-    nominalState_.block<3, 1>(VEL_IDX, 0) += (acc_global + a_gravity_)*dt;
+    nominalState_.block<3, 1>(VEL_IDX, 0) += (acc_global - a_gravity_)*dt;
+    std::cout << "vel: \n" << getVel() << std::endl;
+    std::cout << "pos: \n" << getPos() << std::endl;
+    std::cout << "deltaPos: \n" << delta_pos << std::endl;
+
     nominalState_.block<4, 1>(QUAT_IDX, 0) = quatToHamilton(getQuat()*q_delta_theta).normalized();
 
 
-
+    /**This is already computed in unrolled manner below
     // // Jacobian of the state transition (eqn 269, page 59)
     // // Update dynamic parts only
     // // dPos row
@@ -189,9 +209,10 @@ void ESKF::predictIMU(const Vector3f& a_m, const Vector3f& omega_m, const float 
     // // dTheta row
     // F_x_.block<3, 3>(dTHETA_IDX, dTHETA_IDX) = R_delta_theta.transpose();
     // F_x_.block<3, 3>(dTHETA_IDX, dGB_IDX).diagonal().fill(-dt); // = -I_3 * dt;
-
-    // Predict P and inject variance (with diagonal optimization)
+    //
+    // // Predict P and inject variance (with diagonal optimization)
     // P_ = F_x_*P_*F_x_.transpose();
+    **/
 
     Matrix<float, dSTATE_SIZE, dSTATE_SIZE> Pnew;
     unrolledFPFt(P_, Pnew, dt,
@@ -205,21 +226,6 @@ void ESKF::predictIMU(const Vector3f& a_m, const Vector3f& omega_m, const float 
     P_.diagonal().block<3, 1>(dTHETA_IDX, 0).array() += var_omega_ * SQ(dt);
     P_.diagonal().block<3, 1>(dAB_IDX, 0).array() += var_acc_bias_ * dt;
     P_.diagonal().block<3, 1>(dGB_IDX, 0).array() += var_omega_bias_ * dt;
-
-    if(delayHandling_ == applyUpdateToNew ||delayHandling_ == larsonAverageIMU  ){
-        //store state for later.
-        std::pair<lTime,Eigen::Matrix<float, STATE_SIZE, 1>> thisState;
-        thisState.first = stamp;
-        thisState.second = nominalState_;
-        stateHistoryPtr_->at(recentPtr%bufferL_) = thisState;
-
-    }
-    if(delayHandling_ == larsonAverageIMU  ){
-        std::pair<lTime,Eigen::Matrix<float, dSTATE_SIZE, dSTATE_SIZE>> thisP;
-        thisP.first = stamp;
-        thisP.second = P_;
-        PHistoryPtr_->at(recentPtr%bufferL_) = thisP;
-    }
 }
 
 // eqn 280, page 62
@@ -279,7 +285,7 @@ int ESKF::getClosestTime(std::vector<imuMeasurement>*  ptr, lTime stamp){
     return recentPtr%bufferL_;
 }
 
-
+//stamp + now
 void ESKF::measurePos(const Vector3f& pos_meas, const Matrix3f& pos_covariance,lTime stamp ,lTime now) {
     // delta measurement
     if(firstMeasTime == lTime(INT32_MAX,INT32_MAX)) firstMeasTime = now;
@@ -287,7 +293,7 @@ void ESKF::measurePos(const Vector3f& pos_meas, const Matrix3f& pos_covariance,l
     Vector3f delta_pos;
     if(delayHandling_ == noMethod || delayHandling_ == larsonAverageIMU){
         delta_pos = pos_meas - getPos();
-        cout << "noMethod delta Pos: "<< delta_pos <<endl;
+
     }
 
     if(delayHandling_ == applyUpdateToNew ){
@@ -297,7 +303,6 @@ void ESKF::measurePos(const Vector3f& pos_meas, const Matrix3f& pos_covariance,l
         delta_pos = pos_meas - stateHistoryPtr_->at(bestTimeIndex).second.block<3, 1>(POS_IDX, 0);
         }
         else delta_pos = pos_meas - getPos();
-        cout << "UpToNew Pos: "<< delta_pos <<endl;
     }
     if(delayHandling_ == larsonAverageIMU){
         if(lastMeasurement < imuHistoryPtr_->at((recentPtr + 1)%bufferL_).time) firstMeasTime = now;
